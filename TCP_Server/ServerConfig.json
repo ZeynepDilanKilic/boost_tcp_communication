@@ -1,0 +1,5 @@
+{
+    "restartOnErrors": [10061, 10060, 10051],
+	"maxConnectionLimit": 5,
+	"timeoutDuration":1000
+}
