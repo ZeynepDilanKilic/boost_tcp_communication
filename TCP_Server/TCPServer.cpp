@@ -52,7 +52,7 @@ void TCPServer::handleCommunication()
 
 void TCPServer::sendMessageToClient()
 {
-    std::string buffer;
+    std::string buffer ="Hello from Server";
     size_t size = buffer.size();
     boost::asio::write(m_socket, boost::asio::buffer(&size, sizeof(size)));
     boost::asio::write(m_socket, boost::asio::buffer(buffer));
