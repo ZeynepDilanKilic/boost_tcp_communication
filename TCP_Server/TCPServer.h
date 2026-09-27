@@ -1,49 +1,28 @@
 #pragma once
-#include <iostream>
-#include <fstream>
-#include <boost/asio.hpp>
-#include <thread>
+#include "common/FramedConnection.h"
 #include <set>
-#include "../nlohmann-json/json.hpp"
 
-using boost::asio::ip::tcp;
-
-class TCPServer
-{
+class TCPServer {
 public:
-    TCPServer(boost::asio::io_service &io_service);
+    explicit TCPServer(boost::asio::io_context& io, std::uint16_t port = 12345,
+                       const std::string& config_file = "");
     ~TCPServer();
-
     void start();
     void stopServer();
     void restartServer();
 
 private:
+    class Session;
     void acceptConnection();
-    void handleCommunication();
-    void receiveMessageFromClient();
-    void sendMessageToClient();
-    void handleError(const boost::system::error_code &ec);
+    void loadConfiguration(const std::string& path);
 
-    bool isCriticalError(const boost::system::error_code &ec);
-    bool shouldRestart(const boost::system::error_code &ec);
-    bool userPrefersRestart(const boost::system::error_code &ec);
-    void loadConfiguration(const std::string &configFile);
-
-private:
-    boost::asio::io_service &m_io_service;
-    tcp::acceptor m_acceptor;
-    tcp::socket m_socket;
-    bool is_running; // To monitor the server's operational status
-    int error_count = 0;
-    const int MAX_ERROR_THRESHOLD = 5; // An example error boundary
-
-    struct ServerConfig
-    {
-        std::set<int> restartOnErrors; // A list of error code
-        int maxConnectionLimit;
-        int timeoutDuration;
-    };
-
-    ServerConfig serverConfig;
+    boost::asio::io_context& io_;
+    tcp_demo::tcp::acceptor acceptor_;
+    boost::asio::steady_timer accept_retry_;
+    std::set<std::shared_ptr<Session>> sessions_;
+    std::uint16_t port_;
+    std::size_t max_connections_ = 5;
+    std::chrono::milliseconds timeout_{5000};
+    std::uint64_t generation_ = 0;
+    bool running_ = false;
 };

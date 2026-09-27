@@ -1,195 +1,140 @@
 #include "TCPServer.h"
+#include "nlohmann-json/json.hpp"
+#include <fstream>
+#include <iostream>
 
-TCPServer::TCPServer(boost::asio::io_service &io_service)
-    : m_io_service(io_service), m_acceptor(io_service, tcp::endpoint(tcp::v4(), 12345)),
-      m_socket(io_service)
-{
-    loadConfiguration("ServerConfig.json");
+using tcp_demo::ErrorCode;
+using tcp_demo::tcp;
+
+class TCPServer::Session : public std::enable_shared_from_this<Session> {
+public:
+    Session(boost::asio::io_context& io, std::chrono::milliseconds timeout,
+            std::function<void(std::shared_ptr<Session>)> on_close)
+        : connection_(std::make_shared<tcp_demo::FramedConnection>(io, timeout)),
+          on_close_(std::move(on_close)) {}
+
+    tcp::socket& socket() { return connection_->socket(); }
+
+    void start() {
+        ErrorCode ec;
+        socket().set_option(tcp::no_delay(true), ec);
+        if (ec) return stop();
+        read();
+    }
+
+    void stop() {
+        if (stopped_) return;
+        stopped_ = true;
+        connection_->close();
+        on_close_(shared_from_this());
+    }
+
+private:
+    void read() {
+        auto self = shared_from_this();
+        connection_->asyncRead([self](ErrorCode ec, std::string message) {
+            if (self->stopped_) return;
+            if (ec) return self->fail(ec);
+            self->connection_->asyncWrite(message, [self](ErrorCode write_ec) {
+                if (self->stopped_) return;
+                if (write_ec) return self->fail(write_ec);
+                self->read();
+            });
+        });
+    }
+
+    void fail(ErrorCode ec) {
+        if (ec != boost::asio::error::eof && ec != boost::asio::error::operation_aborted) {
+            std::cerr << "Session closed: " << ec.message() << '\n';
+        }
+        stop();
+    }
+
+    std::shared_ptr<tcp_demo::FramedConnection> connection_;
+    std::function<void(std::shared_ptr<Session>)> on_close_;
+    bool stopped_ = false;
+};
+
+TCPServer::TCPServer(boost::asio::io_context& io, std::uint16_t port,
+                     const std::string& config_file)
+    : io_(io), acceptor_(io), accept_retry_(io), port_(port) {
+    if (!config_file.empty()) loadConfiguration(config_file);
 }
 
-TCPServer::~TCPServer()
-{
+TCPServer::~TCPServer() { stopServer(); }
+
+void TCPServer::start() {
+    if (running_) return;
+    acceptor_.open(tcp::v4());
+    acceptor_.set_option(tcp::acceptor::reuse_address(true));
+    acceptor_.bind(tcp::endpoint(tcp::v4(), port_));
+    acceptor_.listen();
+    port_ = acceptor_.local_endpoint().port();
+    running_ = true;
+    ++generation_;
+    std::cout << "Listening on 0.0.0.0:" << port_
+              << " (max_connections=" << max_connections_
+              << ", timeout_ms=" << timeout_.count() << ")" << std::endl;
+    acceptConnection();
 }
 
-void TCPServer::start()
-{
-    if (!is_running)
-    {
+void TCPServer::acceptConnection() {
+    if (!running_) return;
+    const auto generation = generation_;
+    auto session = std::make_shared<Session>(io_, timeout_,
+        [this](std::shared_ptr<Session> closed) { sessions_.erase(closed); });
+    acceptor_.async_accept(session->socket(), [this, session, generation](ErrorCode ec) {
+        if (!running_ || generation != generation_) return;
+        if (ec) {
+            std::cerr << "Accept failed: " << ec.message() << "; retrying in 1 s\n";
+            accept_retry_.expires_after(std::chrono::seconds(1));
+            accept_retry_.async_wait([this, generation](ErrorCode timer_ec) {
+                if (!timer_ec && running_ && generation == generation_) acceptConnection();
+            });
+            return;
+        }
+        if (sessions_.size() >= max_connections_) {
+            session->stop();
+        } else {
+            sessions_.insert(session);
+            session->start();
+        }
         acceptConnection();
-        handleCommunication();
-        is_running = true;
+    });
+}
+
+void TCPServer::stopServer() {
+    running_ = false;
+    ++generation_;
+    ErrorCode ignored;
+    accept_retry_.cancel(ignored);
+    acceptor_.close(ignored);
+    while (!sessions_.empty()) {
+        auto session = *sessions_.begin();
+        session->stop();
     }
 }
 
-void TCPServer::acceptConnection()
-{
-    int retry_limit = 5;
-    for (int i = 0; i < retry_limit; ++i)
-    {
-        boost::system::error_code ec;
-        m_acceptor.accept(m_socket, ec);
-
-        if (!ec)
-        {
-            return; // Connection success
-        }
-
-        std::cerr << "Connection error, retrying...(" << i + 1 << "/" << retry_limit << "): " << ec.message() << std::endl;
-        handleError(ec);
-        std::this_thread::sleep_for(std::chrono::seconds(1)); // 1 saniye bekle
-    }
-}
-
-void TCPServer::handleCommunication()
-{
-    while (true)
-    {
-        sendMessageToClient();
-        receiveMessageFromClient();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    }
-}
-
-void TCPServer::sendMessageToClient()
-{
-    std::string buffer ="Hello from Server";
-    size_t size = buffer.size();
-    boost::asio::write(m_socket, boost::asio::buffer(&size, sizeof(size)));
-    boost::asio::write(m_socket, boost::asio::buffer(buffer));
-}
-
-void TCPServer::receiveMessageFromClient()
-{
-    boost::system::error_code ec;
-    size_t expected_size;
-
-    // Get message size first
-    boost::asio::read(m_socket, boost::asio::buffer(&expected_size, sizeof(expected_size)), ec);
-
-    if (!ec && expected_size > 0 && expected_size <= 1024)
-    { // Here we set a maximum size limit
-        std::vector<char> incoming_data(expected_size);
-        boost::asio::read(m_socket, boost::asio::buffer(incoming_data), ec);
-
-        if (!ec)
-        {
-            std::cout << "Receive message: " << std::string(incoming_data.begin(), incoming_data.end()) << std::endl;
-        }
-        else
-        {
-            std::cerr << "When receiving an error message: " << ec.message() << std::endl;
-            handleError(ec);
-        }
-    }
-    else
-    {
-        std::cerr << "Invalid message size or error: " << ec.message() << std::endl;
-        handleError(ec);
-    }
-}
-
-void TCPServer::handleError(const boost::system::error_code &ec)
-{
-    // Error handling based on user preference
-    if (userPrefersRestart(ec))
-    {
-        restartServer();
-        return;
-    }
-
-    // Critical error checking
-    if (isCriticalError(ec))
-    {
-        stopServer();
-        return;
-    }
-
-    // Error frequency check
-    if (++error_count > MAX_ERROR_THRESHOLD)
-    {
-        stopServer();
-        return;
-    }
-
-   // Restart for certain error types
-    if (shouldRestart(ec))
-    {
-        restartServer();
-        return;
-    }
-
-    // Default action for other cases
+void TCPServer::restartServer() {
     stopServer();
+    start();
 }
 
-bool TCPServer::isCriticalError(const boost::system::error_code &ec)
-{
-    // Example: Memory leaks, resource exhaustion, internal server errors, etc.
-    return ec == boost::asio::error::no_memory ||
-           ec == boost::asio::error::operation_aborted ||
-           ec == boost::asio::error::service_not_found;
-}
-
-bool TCPServer::shouldRestart(const boost::system::error_code &ec)
-{
-    // Example: Temporary connection problems, timeout errors, etc.
-    return ec == boost::asio::error::connection_refused ||
-           ec == boost::asio::error::timed_out ||
-           ec == boost::asio::error::host_unreachable;
-}
-
-bool TCPServer::userPrefersRestart(const boost::system::error_code &ec)
-{
-   return serverConfig.restartOnErrors.find(ec.value()) != serverConfig.restartOnErrors.end();
-}
-
-void TCPServer::stopServer()
-{
-    // Stop if server is running
-    if (is_running)
-    {
-        m_socket.close();
-        m_acceptor.close();
-        is_running = false;
-    }
-}
-
-void TCPServer::restartServer()
-{
-    stopServer();
-    is_running = false;
-    start(); // restart the server
-}
-void TCPServer::loadConfiguration(const std::string &configFile)
-{
-    std::ifstream f("ServerConfig.json");
-    nlohmann::json j_data;
-    f >> j_data;
-
-
-    // Reading and parsing the configuration file
-    // Example: Reading from JSON file and loading into userConfig object
-        // JSON verilerini yapıya aktarın
-    if (j_data.contains("restartOnErrors") && j_data["restartOnErrors"].is_array()) {
-        for (auto& errorCode : j_data["restartOnErrors"]) {
-            serverConfig.restartOnErrors.insert(errorCode.get<int>());
+void TCPServer::loadConfiguration(const std::string& path) {
+    std::ifstream file(path);
+    if (!file) throw std::runtime_error("Cannot open configuration: " + path);
+    const auto config = nlohmann::json::parse(file);
+    if (!config.is_object()) throw std::runtime_error("Configuration must be a JSON object");
+    const auto integer = [&config](const char* key, std::int64_t fallback,
+                                   std::int64_t maximum) {
+        if (!config.contains(key)) return fallback;
+        const auto& value = config.at(key);
+        if (!value.is_number_integer() || value < 1 || value > maximum) {
+            throw std::runtime_error(std::string(key) + " must be an integer in [1, " +
+                                     std::to_string(maximum) + "]");
         }
-    }
-
-    if (j_data.contains("maxConnectionLimit") && j_data["maxConnectionLimit"].is_number()) {
-        serverConfig.maxConnectionLimit = j_data["maxConnectionLimit"].get<int>();
-    }
-
-    if (j_data.contains("timeoutDuration") && j_data["timeoutDuration"].is_number()) {
-        serverConfig.timeoutDuration = j_data["timeoutDuration"].get<int>();
-    }
-
-    // Yapılandırmanın doğru okunup okunmadığını kontrol edin
-    std::cout << "Max Connection Limit: " << serverConfig.maxConnectionLimit << "\n";
-    std::cout << "Timeout Duration: " << serverConfig.timeoutDuration << "\n";
-    std::cout << "Restart on Errors: ";
-    for (int code : serverConfig.restartOnErrors) {
-        std::cout << code << " ";
-    }
-    std::cout << std::endl;
+        return value.get<std::int64_t>();
+    };
+    max_connections_ = static_cast<std::size_t>(integer("maxConnectionLimit", 5, 10000));
+    timeout_ = std::chrono::milliseconds(integer("timeoutDuration", 5000, 3600000));
 }
